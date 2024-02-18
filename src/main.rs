@@ -1,3 +1,5 @@
+use std::time::SystemTime;
+
 use btleplug::api::{
     Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter,
     ValueNotification, WriteType,
@@ -7,15 +9,42 @@ use btleplug::Result;
 use bytemuck::{Pod, Zeroable};
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use miette::IntoDiagnostic;
+use pretty_assertions::assert_eq;
 use uuid::{uuid, Uuid};
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> miette::Result<()> {
-    app().await.into_diagnostic()
+async fn main() -> Result<()> {
+    let mut watch = get_infinitime().await?.unwrap();
+
+    let version = watch.version().await?;
+    println!("version {version}");
+
+    let entries = watch.list_dir("/").await?;
+    for e in entries {
+        println!("{e:?}");
+    }
+
+    let settings_dat = watch.read_file("settings.dat").await?;
+    println!("{settings_dat:?}");
+
+    let to_write = std::fs::read("../../../Desktop/1377153351m.ldr").unwrap();
+
+    watch.delete_file("/1377153351m.ldr").await?;
+    watch.write_file("/1377153351m.ldr", &to_write, 0).await?;
+    let written = watch.read_file("/1377153351m.ldr").await?;
+
+    assert_eq!(to_write.len(), written.len());
+    assert_eq!(to_write[..64], written[..64]);
+    assert_eq!(
+        to_write[to_write.len() - 64..],
+        written[written.len() - 64..],
+    );
+    assert_eq!(to_write, written);
+
+    Ok(())
 }
 
-async fn app() -> Result<()> {
+async fn get_infinitime() -> Result<Option<InfiniTime>> {
     let manager = Manager::new().await?;
     let adapter = manager.adapters().await?[0].clone();
 
@@ -43,28 +72,11 @@ async fn app() -> Result<()> {
 
         adapter.stop_scan().await?;
 
-        infinitime(peripheral).await?;
-        break;
+        let watch = InfiniTime::new(peripheral).await?;
+        return Ok(Some(watch));
     }
 
-    Ok(())
-}
-
-async fn infinitime(peripheral: Peripheral) -> Result<()> {
-    let mut watch = InfiniTime::new(peripheral).await?;
-
-    let version = watch.version().await?;
-    println!("version {version}");
-
-    let entries = watch.list_dir("/").await?;
-    for e in entries {
-        println!("{e:?}");
-    }
-
-    let settings_dat = watch.read_file("settings.dat").await?;
-    println!("{settings_dat:?}");
-
-    Ok(())
+    Ok(None)
 }
 
 pub const VERSION: Uuid = uuid!("adaf0100-4669-6c65-5472-616e73666572");
@@ -76,6 +88,8 @@ pub struct InfiniTime {
     version_c: Characteristic,
     transfer_c: Characteristic,
 }
+
+const MAX_PAYLOAD: u32 = 0xE7;
 
 impl InfiniTime {
     pub async fn new(peripheral: Peripheral) -> Result<Self> {
@@ -163,7 +177,7 @@ impl InfiniTime {
             buf.push(0);
             buf.extend((path.len() as u16).to_le_bytes());
             buf.extend(offset.to_le_bytes());
-            buf.extend(u32::MAX.to_le_bytes());
+            buf.extend(MAX_PAYLOAD.to_le_bytes());
             buf.extend(path.as_bytes());
         })
         .await?;
@@ -181,6 +195,7 @@ impl InfiniTime {
             assert_eq!(response.body.current_len as usize, payload.len());
 
             contents.extend(payload);
+            println!("{} bytes, total {}", payload.len(), contents.len());
             if contents.len() == response.body.total_len as usize {
                 break;
             }
@@ -191,12 +206,89 @@ impl InfiniTime {
                 buf.push(0x01);
                 buf.extend([0, 0]);
                 buf.extend(offset.to_le_bytes());
-                buf.extend(u32::MAX.to_le_bytes());
+                buf.extend(MAX_PAYLOAD.to_le_bytes());
             })
             .await?;
         }
 
         Ok(contents)
+    }
+
+    pub async fn write_file(
+        &mut self,
+        path: &str,
+        data: &[u8],
+        timestamp: impl Timestamp,
+    ) -> Result<()> {
+        assert!(path.len() <= u16::MAX as usize);
+        assert!(data.len() <= u32::MAX as usize);
+
+        let mut offset = 0_u32;
+
+        self.send(|buf| {
+            buf.push(0x20);
+            buf.push(0);
+            buf.extend((path.len() as u16).to_le_bytes());
+            buf.extend(offset.to_le_bytes());
+            buf.extend(timestamp.to_u64().to_le_bytes());
+            buf.extend((data.len() as u32).to_le_bytes());
+            buf.extend(path.as_bytes());
+        })
+        .await?;
+
+        while let Some(notif) = self.notifications.next().await {
+            let response: &Response<Receipt> = bytemuck::from_bytes(&notif.value);
+            println!("{response:?}");
+
+            assert_eq!(response.command, 0x21);
+            assert_eq!(response.status, 1, "bad status");
+            // assert_eq!({ response.body.offset }, offset);
+
+            let mut remaining_data = &data[offset as usize..];
+
+            if remaining_data.len() > MAX_PAYLOAD as usize {
+                remaining_data = &remaining_data[..MAX_PAYLOAD as usize];
+            }
+
+            if remaining_data.is_empty() {
+                break;
+            }
+
+            println!("sending {} bytes, offset {offset}", remaining_data.len());
+
+            self.send(|buf| {
+                buf.push(0x22);
+                buf.push(1);
+                buf.extend([0, 0]);
+                buf.extend(offset.to_le_bytes());
+                buf.extend((remaining_data.len() as u32).to_le_bytes());
+                buf.extend(remaining_data);
+            })
+            .await?;
+
+            offset += remaining_data.len() as u32;
+        }
+
+        Ok(())
+    }
+
+    pub async fn delete_file(&mut self, path: &str) -> Result<()> {
+        assert!(path.len() <= u16::MAX as usize);
+
+        self.send(|buf| {
+            buf.push(0x30);
+            buf.push(0);
+            buf.extend((path.len() as u16).to_le_bytes());
+            buf.extend(path.as_bytes());
+        })
+        .await?;
+
+        let notif = self.notifications.next().await.unwrap();
+        let response: &Response<()> = bytemuck::from_bytes(&notif.value);
+        assert_eq!(response.command, 0x31);
+        assert_eq!(response.status, 1);
+
+        Ok(())
     }
 }
 
@@ -204,7 +296,7 @@ impl InfiniTime {
 #[repr(C, packed)]
 struct Response<T> {
     command: u8,
-    status: u8,
+    status: i8,
     body: T,
 }
 
@@ -228,10 +320,39 @@ struct FileChunk {
     current_len: u32,
 }
 
+#[derive(Zeroable, Pod, Copy, Clone, Debug)]
+#[repr(C, packed)]
+struct Receipt {
+    _padding: [u8; 2],
+    offset: u32,
+    timestamp: u64,
+    remaining: u32,
+}
+
 #[derive(Debug)]
 pub struct DirEntry {
     pub flags: u32,
     pub timestamp: u64,
     pub size: u32,
     pub path: String,
+}
+
+pub trait Timestamp {
+    fn to_u64(&self) -> u64;
+}
+
+impl Timestamp for u64 {
+    fn to_u64(&self) -> u64 {
+        *self
+    }
+}
+
+impl Timestamp for SystemTime {
+    fn to_u64(&self) -> u64 {
+        self.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .try_into()
+            .unwrap()
+    }
 }

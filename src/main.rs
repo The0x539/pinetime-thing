@@ -9,7 +9,6 @@ use btleplug::Result;
 use bytemuck::{Pod, Zeroable};
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use pretty_assertions::assert_eq;
 use uuid::{uuid, Uuid};
 
 #[tokio::main(flavor = "current_thread")]
@@ -23,23 +22,6 @@ async fn main() -> Result<()> {
     for e in entries {
         println!("{e:?}");
     }
-
-    let settings_dat = watch.read_file("settings.dat").await?;
-    println!("{settings_dat:?}");
-
-    let to_write = std::fs::read("../../../Desktop/1377153351m.ldr").unwrap();
-
-    watch.delete_file("/1377153351m.ldr").await?;
-    watch.write_file("/1377153351m.ldr", &to_write, 0).await?;
-    let written = watch.read_file("/1377153351m.ldr").await?;
-
-    assert_eq!(to_write.len(), written.len());
-    assert_eq!(to_write[..64], written[..64]);
-    assert_eq!(
-        to_write[to_write.len() - 64..],
-        written[written.len() - 64..],
-    );
-    assert_eq!(to_write, written);
 
     Ok(())
 }
@@ -129,8 +111,6 @@ impl InfiniTime {
     }
 
     pub async fn list_dir(&mut self, path: &str) -> Result<Vec<DirEntry>> {
-        assert!(path.len() <= u16::MAX as usize);
-
         self.send(|buf| {
             buf.push(0x50);
             buf.push(0);
@@ -168,8 +148,6 @@ impl InfiniTime {
     }
 
     pub async fn read_file(&mut self, path: &str) -> Result<Vec<u8>> {
-        assert!(path.len() <= u16::MAX as usize);
-
         let mut offset = 0_u32;
 
         self.send(|buf| {
@@ -195,7 +173,6 @@ impl InfiniTime {
             assert_eq!(response.body.current_len as usize, payload.len());
 
             contents.extend(payload);
-            println!("{} bytes, total {}", payload.len(), contents.len());
             if contents.len() == response.body.total_len as usize {
                 break;
             }
@@ -220,9 +197,6 @@ impl InfiniTime {
         data: &[u8],
         timestamp: impl Timestamp,
     ) -> Result<()> {
-        assert!(path.len() <= u16::MAX as usize);
-        assert!(data.len() <= u32::MAX as usize);
-
         let mut offset = 0_u32;
 
         self.send(|buf| {
@@ -237,8 +211,7 @@ impl InfiniTime {
         .await?;
 
         while let Some(notif) = self.notifications.next().await {
-            let response: &Response<Receipt> = bytemuck::from_bytes(&notif.value);
-            println!("{response:?}");
+            let response: &Response<WriteReceipt> = bytemuck::from_bytes(&notif.value);
 
             assert_eq!(response.command, 0x21);
             assert_eq!(response.status, 1, "bad status");
@@ -253,8 +226,6 @@ impl InfiniTime {
             if remaining_data.is_empty() {
                 break;
             }
-
-            println!("sending {} bytes, offset {offset}", remaining_data.len());
 
             self.send(|buf| {
                 buf.push(0x22);
@@ -273,8 +244,6 @@ impl InfiniTime {
     }
 
     pub async fn delete_file(&mut self, path: &str) -> Result<()> {
-        assert!(path.len() <= u16::MAX as usize);
-
         self.send(|buf| {
             buf.push(0x30);
             buf.push(0);
@@ -286,6 +255,45 @@ impl InfiniTime {
         let notif = self.notifications.next().await.unwrap();
         let response: &Response<()> = bytemuck::from_bytes(&notif.value);
         assert_eq!(response.command, 0x31);
+        assert_eq!(response.status, 1);
+
+        Ok(())
+    }
+
+    pub async fn create_dir(&mut self, path: &str, timestamp: impl Timestamp) -> Result<()> {
+        self.send(|buf| {
+            buf.push(0x40);
+            buf.push(0);
+            buf.extend((path.len() as u16).to_le_bytes());
+            buf.extend([0; 4]);
+            buf.extend(timestamp.to_u64().to_le_bytes());
+            buf.extend(path.as_bytes());
+        })
+        .await?;
+
+        let notif = self.notifications.next().await.unwrap();
+        let response: &Response<MkdirReceipt> = bytemuck::from_bytes(&notif.value);
+        assert_eq!(response.command, 0x41);
+        assert_eq!(response.status, 1);
+
+        Ok(())
+    }
+
+    pub async fn move_file(&mut self, from: &str, to: &str) -> Result<()> {
+        self.send(|buf| {
+            buf.push(0x60);
+            buf.push(0);
+            buf.extend((from.len() as u16).to_le_bytes());
+            buf.extend((to.len() as u16).to_le_bytes());
+            buf.extend(from.as_bytes());
+            buf.push(0);
+            buf.extend(to.as_bytes());
+        })
+        .await?;
+
+        let notif = self.notifications.next().await.unwrap();
+        let response: &Response<()> = bytemuck::from_bytes(&notif.value);
+        assert_eq!(response.command, 0x41);
         assert_eq!(response.status, 1);
 
         Ok(())
@@ -322,11 +330,18 @@ struct FileChunk {
 
 #[derive(Zeroable, Pod, Copy, Clone, Debug)]
 #[repr(C, packed)]
-struct Receipt {
+struct WriteReceipt {
     _padding: [u8; 2],
     offset: u32,
     timestamp: u64,
     remaining: u32,
+}
+
+#[derive(Zeroable, Pod, Copy, Clone, Debug)]
+#[repr(C, packed)]
+struct MkdirReceipt {
+    _padding: [u8; 6],
+    timestamp: u64,
 }
 
 #[derive(Debug)]

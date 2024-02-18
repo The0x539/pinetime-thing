@@ -9,6 +9,5 @@ edition = "2021"
 btleplug = "0.11.5"
 bytemuck = { version = "1.14.3", features = ["derive"] }
 futures = "0.3.30"
-pretty_assertions = "1.4.0"
 tokio = { version = "1.36.0", features = ["rt", "macros"] }
 uuid = "1.7.0"

@@ -6,10 +6,12 @@ use btleplug::api::{
 };
 use btleplug::platform::{Manager, Peripheral};
 use btleplug::Result;
-use bytemuck::{Pod, Zeroable};
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use responses::{FileChunk, RawDirEntry};
 use uuid::{uuid, Uuid};
+
+use crate::responses::*;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -110,6 +112,31 @@ impl InfiniTime {
         Ok(())
     }
 
+    async fn recv<T: responses::Body>(&mut self) -> Option<responses::Response<T>> {
+        let notif = self.notifications.next().await?;
+        let response: &responses::Response<T> = bytemuck::from_bytes(&notif.value);
+
+        assert_eq!(response.command, T::COMMAND);
+        assert_eq!(response.status, 1, "bad status");
+
+        Some(*response)
+    }
+
+    async fn payload_recv<T: responses::Body>(
+        &mut self,
+    ) -> Option<(responses::Response<T>, Vec<u8>)> {
+        let notif = self.notifications.next().await?;
+        let mut data = notif.value;
+        let payload = data.split_off(std::mem::size_of::<T>());
+
+        let response: &responses::Response<T> = bytemuck::from_bytes(&data);
+
+        assert_eq!(response.command, T::COMMAND);
+        assert_eq!(response.status, 1, "bad status");
+
+        Some((*response, payload))
+    }
+
     pub async fn list_dir(&mut self, path: &str) -> Result<Vec<DirEntry>> {
         self.send(|buf| {
             buf.push(0x50);
@@ -120,17 +147,14 @@ impl InfiniTime {
         .await?;
 
         let mut entries = vec![];
-        while let Some(notif) = self.notifications.next().await {
-            let n = std::mem::size_of::<Response<RawDirEntry>>();
-            let (header, path) = notif.value.split_at(n);
 
-            let raw: &Response<RawDirEntry> = bytemuck::from_bytes(header);
+        while let Some((raw, path)) = self.payload_recv::<RawDirEntry>().await {
             assert_eq!(raw.command, 0x51);
             assert_eq!(raw.status, 1);
             assert_eq!(raw.body.entry_number as usize, entries.len());
             assert_eq!(raw.body.path_len as usize, path.len());
 
-            let path = String::from_utf8_lossy(path).into_owned();
+            let path = String::from_utf8_lossy(&path).into_owned();
 
             entries.push(DirEntry {
                 flags: raw.body.flags,
@@ -161,12 +185,8 @@ impl InfiniTime {
         .await?;
 
         let mut contents = Vec::new();
-        while let Some(notif) = self.notifications.next().await {
-            let n = std::mem::size_of::<Response<FileChunk>>();
-            let (header, payload) = notif.value.split_at(n);
 
-            let response: &Response<FileChunk> = bytemuck::from_bytes(header);
-
+        while let Some((response, payload)) = self.payload_recv::<FileChunk>().await {
             assert_eq!(response.command, 0x11);
             assert_eq!(response.status, 1);
             assert_eq!({ response.body.offset }, offset);
@@ -210,11 +230,7 @@ impl InfiniTime {
         })
         .await?;
 
-        while let Some(notif) = self.notifications.next().await {
-            let response: &Response<WriteReceipt> = bytemuck::from_bytes(&notif.value);
-
-            assert_eq!(response.command, 0x21);
-            assert_eq!(response.status, 1, "bad status");
+        while let Some(_response) = self.recv::<WriteReceipt>().await {
             // assert_eq!({ response.body.offset }, offset);
 
             let mut remaining_data = &data[offset as usize..];
@@ -252,10 +268,7 @@ impl InfiniTime {
         })
         .await?;
 
-        let notif = self.notifications.next().await.unwrap();
-        let response: &Response<()> = bytemuck::from_bytes(&notif.value);
-        assert_eq!(response.command, 0x31);
-        assert_eq!(response.status, 1);
+        self.recv::<RmReceipt>().await.unwrap();
 
         Ok(())
     }
@@ -271,10 +284,7 @@ impl InfiniTime {
         })
         .await?;
 
-        let notif = self.notifications.next().await.unwrap();
-        let response: &Response<MkdirReceipt> = bytemuck::from_bytes(&notif.value);
-        assert_eq!(response.command, 0x41);
-        assert_eq!(response.status, 1);
+        self.recv::<MkdirReceipt>().await.unwrap();
 
         Ok(())
     }
@@ -291,57 +301,94 @@ impl InfiniTime {
         })
         .await?;
 
-        let notif = self.notifications.next().await.unwrap();
-        let response: &Response<()> = bytemuck::from_bytes(&notif.value);
-        assert_eq!(response.command, 0x41);
-        assert_eq!(response.status, 1);
+        self.recv::<MvReceipt>().await.unwrap();
 
         Ok(())
     }
 }
 
-#[derive(Zeroable, Pod, Copy, Clone, Debug)]
-#[repr(C, packed)]
-struct Response<T> {
-    command: u8,
-    status: i8,
-    body: T,
-}
+mod responses {
+    use bytemuck::{Pod, Zeroable};
 
-#[derive(Zeroable, Pod, Copy, Clone, Debug)]
-#[repr(C, packed)]
-struct RawDirEntry {
-    path_len: u16,
-    entry_number: u32,
-    entry_count: u32,
-    flags: u32,
-    timestamp: u64,
-    size: u32,
-}
+    #[derive(Zeroable, Pod, Copy, Clone, Debug)]
+    #[repr(C, packed)]
+    pub struct Response<T> {
+        pub command: u8,
+        pub status: i8,
+        pub body: T,
+    }
 
-#[derive(Zeroable, Pod, Copy, Clone, Debug)]
-#[repr(C, packed)]
-struct FileChunk {
-    _padding: [u8; 2],
-    offset: u32,
-    total_len: u32,
-    current_len: u32,
-}
+    #[derive(Zeroable, Pod, Copy, Clone, Debug)]
+    #[repr(C, packed)]
+    pub struct RawDirEntry {
+        pub path_len: u16,
+        pub entry_number: u32,
+        pub entry_count: u32,
+        pub flags: u32,
+        pub timestamp: u64,
+        pub size: u32,
+    }
 
-#[derive(Zeroable, Pod, Copy, Clone, Debug)]
-#[repr(C, packed)]
-struct WriteReceipt {
-    _padding: [u8; 2],
-    offset: u32,
-    timestamp: u64,
-    remaining: u32,
-}
+    #[derive(Zeroable, Pod, Copy, Clone, Debug)]
+    #[repr(C, packed)]
+    pub struct FileChunk {
+        _padding: [u8; 2],
+        pub offset: u32,
+        pub total_len: u32,
+        pub current_len: u32,
+    }
 
-#[derive(Zeroable, Pod, Copy, Clone, Debug)]
-#[repr(C, packed)]
-struct MkdirReceipt {
-    _padding: [u8; 6],
-    timestamp: u64,
+    #[derive(Zeroable, Pod, Copy, Clone, Debug)]
+    #[repr(C, packed)]
+    pub struct WriteReceipt {
+        _padding: [u8; 2],
+        pub offset: u32,
+        pub timestamp: u64,
+        pub remaining: u32,
+    }
+
+    #[derive(Zeroable, Pod, Copy, Clone, Debug)]
+    #[repr(C, packed)]
+    pub struct MkdirReceipt {
+        _padding: [u8; 6],
+        pub timestamp: u64,
+    }
+
+    #[derive(Zeroable, Pod, Copy, Clone, Debug)]
+    #[repr(C)]
+    pub struct MvReceipt;
+
+    #[derive(Zeroable, Pod, Copy, Clone, Debug)]
+    #[repr(C)]
+    pub struct RmReceipt;
+
+    pub trait Body: Pod {
+        const COMMAND: u8;
+    }
+
+    impl Body for FileChunk {
+        const COMMAND: u8 = 0x11;
+    }
+
+    impl Body for WriteReceipt {
+        const COMMAND: u8 = 0x21;
+    }
+
+    impl Body for RmReceipt {
+        const COMMAND: u8 = 0x31;
+    }
+
+    impl Body for MkdirReceipt {
+        const COMMAND: u8 = 0x41;
+    }
+
+    impl Body for RawDirEntry {
+        const COMMAND: u8 = 0x51;
+    }
+
+    impl Body for MvReceipt {
+        const COMMAND: u8 = 0x61;
+    }
 }
 
 #[derive(Debug)]
